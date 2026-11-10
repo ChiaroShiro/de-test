@@ -21,6 +21,8 @@ ap.add_argument("--iters", type=int, default=5)
 ap.add_argument("--max-shards", type=int, default=0)  # 0=全部分片；>0 则均匀抽取这么多个分片
 ap.add_argument("--no-out", action="store_true",
                 help="decode 不传 out，由 nvcomp 自己分配输出（hw 后端报错时可以试试）")
+ap.add_argument("--seg-mb", type=int, default=512,
+                help="每个分片再切成多大的段去压缩/解压（MB），避免单次调用申请过多显存")
 ap.add_argument("--csv", default="results.csv")
 args = ap.parse_args()
 
@@ -48,6 +50,9 @@ dec = {(a, c, b): nvcomp.Codec(algorithm=a, uncomp_chunk_size=c, device_id=args.
                                decompress_backend=find_backend(BK[b]))
        for a in algos for c in chunks for b in backends}
 print("nvcomp", nvcomp.__version__, "| torch", torch.__version__, "| CUDA", torch.version.cuda)
+for g in (G0, G1):
+    free, total = torch.cuda.mem_get_info(g)
+    print(f"{g}: 空闲显存 {free/2**30:.1f} / {total/2**30:.1f} GiB")
 
 
 def sync():
@@ -57,6 +62,7 @@ def sync():
 def bench(fn):                    # 预热 1 次，然后取 iters 次的中位数（秒）
     out = fn(); sync(); ts = []
     for _ in range(args.iters):
+        out = None                # 先释放上一轮的输出，避免显存占用翻倍（不计时）
         sync(); t0 = time.perf_counter(); out = fn(); sync()
         ts.append(time.perf_counter() - t0)
     return sorted(ts)[len(ts) // 2], out
@@ -86,28 +92,36 @@ for i, f in enumerate(shards):
     raw_total += src.numel(); tA_total += tA
     print(f"[{i+1}/{len(shards)}] {os.path.basename(f)} {src.numel()/1e9:.2f} GB  A={tA*1e3:.2f} ms")
 
+    seg = args.seg_mb << 20                                              # 每段字节数
+    offs = range(0, src.numel(), seg)
+    ssegs = [src[o:o + seg] for o in offs]                               # 发送端原始数据分段（视图，不拷贝）
+    dsegs = [dst[o:o + seg] for o in offs]                               # 接收端输出分段（视图，不拷贝）
+
     for a, c in itertools.product(algos, chunks):
-        tc, comp = bench(lambda: enc[a, c].encode(nvcomp.as_array(src)))  # B1：SM 压缩
-        csrc = as_u8(comp, G0)
-        cdst = torch.empty_like(csrc, device=G1)
-        tx, _ = bench(lambda: cdst.copy_(csrc, non_blocking=True))        # B2：NVLink 传压缩数据
-        s = acc.setdefault((a, c), [0, 0.0, 0.0]); s[0] += csrc.numel(); s[1] += tc; s[2] += tx
-        line = f"    {a:7s} chunk={c:>7d} ratio={src.numel()/csrc.numel():.3f} c={tc*1e3:.1f} x={tx*1e3:.2f}"
+        e = enc[a, c]
+        tc, comps = bench(lambda: [e.encode(nvcomp.as_array(x)) for x in ssegs])        # B1：SM 压缩
+        csrcs = [as_u8(x, G0) for x in comps]
+        cdsts = [torch.empty_like(x, device=G1) for x in csrcs]
+        tx, _ = bench(lambda: [y.copy_(x, non_blocking=True) for x, y in zip(csrcs, cdsts)])  # B2：传压缩数据
+        cbytes = sum(x.numel() for x in csrcs)
+        s = acc.setdefault((a, c), [0, 0.0, 0.0]); s[0] += cbytes; s[1] += tc; s[2] += tx
+        line = f"    {a:7s} chunk={c:>7d} ratio={src.numel()/cbytes:.3f} c={tc*1e3:.1f} x={tx*1e3:.2f}"
         for b in backends:
             d = dec[a, c, b]
-            if args.no_out:                                               # B3：解压（nvcomp 分配输出）
-                td, res = bench(lambda: d.decode(nvcomp.as_array(cdst)))
-                out_t = as_u8(res, G1)[:ref.numel()]
+            if args.no_out:                                               # B3：解压（nvcomp 自己分配输出）
+                td, res = bench(lambda: [d.decode(nvcomp.as_array(x)) for x in cdsts])
+                out_t = torch.cat([as_u8(r, G1) for r in res])[:ref.numel()]
             else:                                                         # B3：解压到预分配的 dst
                 dst.zero_()                                               # 清零，防止旧数据掩盖解压失败
-                td, _ = bench(lambda: d.decode(nvcomp.as_array(cdst), out=nvcomp.as_array(dst)))
+                td, _ = bench(lambda: [d.decode(nvcomp.as_array(x), out=nvcomp.as_array(y))
+                                       for x, y in zip(cdsts, dsegs)])
                 out_t = dst
             assert torch.equal(out_t, ref), f"{a}/{c}/{b} 解压结果和原始数据不一致"   # 无损校验
             acc[(a, c, b)] = acc.get((a, c, b), 0.0) + td
             line += f" d[{b}]={td*1e3:.1f}"
         print(line + " ms")
-        del comp, csrc, cdst
-    del src, ref, dst
+        del comps, csrcs, cdsts
+    del src, ref, dst, ssegs, dsegs
     torch.cuda.empty_cache()
 
 GB = raw_total / 1e9
