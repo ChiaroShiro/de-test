@@ -76,6 +76,15 @@ def as_u8(arr, dev):              # nvcomp.Array 转成 torch uint8 张量（零
     return t.view(torch.uint8).reshape(-1)
 
 
+def on(dev, fn):                  # 把 fn 包装成"先切换当前 GPU 到 dev 再执行"
+    # nvcomp.as_array 通过 __cuda_array_interface__ 包装张量，这个协议不带设备号，
+    # nvcomp 会按"当前 GPU"来认定数据所在的卡；不切换的话 GPU1 上的数据会被当成 GPU0 的
+    def run():
+        with torch.cuda.device(dev):
+            return fn()
+    return run
+
+
 shards = sorted(glob.glob(os.path.join(args.model_dir, "*.safetensors")))
 assert shards, f"{args.model_dir} 下没有 .safetensors 文件"
 if args.max_shards:
@@ -99,7 +108,7 @@ for i, f in enumerate(shards):
 
     for a, c in itertools.product(algos, chunks):
         e = enc[a, c]
-        tc, comps = bench(lambda: [e.encode(nvcomp.as_array(x)) for x in ssegs])        # B1：SM 压缩
+        tc, comps = bench(on(G0, lambda: [e.encode(nvcomp.as_array(x)) for x in ssegs]))   # B1：SM 压缩
         csrcs = [as_u8(x, G0) for x in comps]
         cdsts = [torch.empty_like(x, device=G1) for x in csrcs]
         tx, _ = bench(lambda: [y.copy_(x, non_blocking=True) for x, y in zip(csrcs, cdsts)])  # B2：传压缩数据
@@ -109,12 +118,12 @@ for i, f in enumerate(shards):
         for b in backends:
             d = dec[a, c, b]
             if args.no_out:                                               # B3：解压（nvcomp 自己分配输出）
-                td, res = bench(lambda: [d.decode(nvcomp.as_array(x)) for x in cdsts])
+                td, res = bench(on(G1, lambda: [d.decode(nvcomp.as_array(x)) for x in cdsts]))
                 out_t = torch.cat([as_u8(r, G1) for r in res])[:ref.numel()]
             else:                                                         # B3：解压到预分配的 dst
                 dst.zero_()                                               # 清零，防止旧数据掩盖解压失败
-                td, _ = bench(lambda: [d.decode(nvcomp.as_array(x), out=nvcomp.as_array(y))
-                                       for x, y in zip(cdsts, dsegs)])
+                td, _ = bench(on(G1, lambda: [d.decode(nvcomp.as_array(x), out=nvcomp.as_array(y))
+                                              for x, y in zip(cdsts, dsegs)]))
                 out_t = dst
             assert torch.equal(out_t, ref), f"{a}/{c}/{b} 解压结果和原始数据不一致"   # 无损校验
             acc[(a, c, b)] = acc.get((a, c, b), 0.0) + td
