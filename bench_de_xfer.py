@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 # A) NVLink 直传权重   vs   B) SM 压缩 -> NVLink 传压缩数据 -> DE（或 SM）解压
 #
-# 用法示例：
-#   冒烟测试: python bench_de_xfer.py --model-dir /models/xxx --algos LZ4 --chunks 65536 --backends hw --max-shards 1 --iters 3
-#   抽样扫参: python bench_de_xfer.py --model-dir /models/xxx --max-shards 4 --iters 3 --csv sweep.csv
-#   全模型:   python bench_de_xfer.py --model-dir /models/xxx --algos LZ4,Deflate --chunks 1048576 --csv full.csv
+# 用法示例（模型目录默认读环境变量 $MODEL，要先 export）：
+#   export MODEL=/data/models/xxx
+#   冒烟测试: python bench_de_xfer.py --algos LZ4 --chunks 65536 --backends hw --max-shards 1 --iters 3
+#   抽样扫参: python bench_de_xfer.py --max-shards 4 --iters 3 --seg-mb 4096 --csv sweep.csv
+#   全模型:   python bench_de_xfer.py --algos LZ4,Deflate --chunks 1048576 --seg-mb 4096 --csv full.csv
 import argparse, csv, glob, itertools, os, time
 import torch
 from safetensors.torch import load_file
 from nvidia import nvcomp
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--model-dir", required=True)
+ap.add_argument("--model-dir", default=os.environ.get("MODEL"), help="模型目录，默认读环境变量 $MODEL")
 ap.add_argument("--algos", default="LZ4,Snappy,Deflate,Gzip")       # 只有这四种能走 DE
 ap.add_argument("--chunks", default="65536,262144,1048576,4194304")  # DE 单块上限 4 MiB
 ap.add_argument("--backends", default="hw,cuda")   # hw=只走 DE，不满足条件直接报错；cuda=强制用 SM（对照组）
@@ -25,6 +26,7 @@ ap.add_argument("--seg-mb", type=int, default=512,
                 help="每个分片再切成多大的段去压缩/解压（MB），避免单次调用申请过多显存")
 ap.add_argument("--csv", default="results.csv")
 args = ap.parse_args()
+assert args.model_dir, "没有模型目录：先 export MODEL=模型目录，或者用 --model-dir 指定"
 
 G0, G1 = torch.device(f"cuda:{args.src}"), torch.device(f"cuda:{args.dst}")
 assert torch.cuda.can_device_access_peer(args.src, args.dst), "两卡之间不能 P2P，先检查 NVLink fabric"
@@ -109,7 +111,8 @@ for i, f in enumerate(shards):
     for a, c in itertools.product(algos, chunks):
         e = enc[a, c]
         tc, comps = bench(on(G0, lambda: [e.encode(nvcomp.as_array(x)) for x in ssegs]))   # B1：SM 压缩
-        csrcs = [as_u8(x, G0) for x in comps]
+        # encode 返回的数组形状是"预分配的最大容量"，真实压缩大小是 buffer_size，只截取这部分去统计和传输
+        csrcs = [as_u8(x, G0)[:x.buffer_size] for x in comps]
         cdsts = [torch.empty_like(x, device=G1) for x in csrcs]
         tx, _ = bench(lambda: [y.copy_(x, non_blocking=True) for x, y in zip(csrcs, cdsts)])  # B2：传压缩数据
         cbytes = sum(x.numel() for x in csrcs)
@@ -139,16 +142,22 @@ new = not os.path.exists(args.csv)
 with open(args.csv, "a", newline="") as fp:
     w = csv.writer(fp)
     if new:
-        w.writerow(["algo", "chunk", "backend", "raw_GB", "ratio", "A_s", "comp_s", "xfer_s", "decomp_s",
-                    "B_serial_s", "B_pipe_s", "speedup_serial", "speedup_pipe", "comp_GBps", "decomp_GBps"])
+        w.writerow(["algo", "chunk", "backend", "raw_GB", "comp_GB", "ratio", "A_s", "comp_s", "xfer_s",
+                    "decomp_s", "B_serial_s", "B_pipe_s", "speedup_serial", "speedup_pipe",
+                    "comp_GBps", "xfer_GBps", "decomp_GBps"])
     for a, c in itertools.product(algos, chunks):
         cb, tc, tx = acc[(a, c)]
+        CGB = cb / 1e9                                   # 实际传输的压缩数据量
         for b in backends:
             td = acc[(a, c, b)]
             ser, pipe = tc + tx + td, max(tc, tx, td)
-            print(f"{a:7s} chunk={c:>7d} {b:4s} 压缩率={raw_total/cb:.3f}  B串行={ser:.3f}s  B流水≈{pipe:.3f}s  "
-                  f"加速比(串行/流水)={tA_total/ser:.2f}/{tA_total/pipe:.2f}  "
-                  f"压缩 {GB/tc:.0f} GB/s  解压 {GB/td:.0f} GB/s")
-            w.writerow([a, c, b, f"{GB:.3f}", f"{raw_total/cb:.4f}", f"{tA_total:.4f}", f"{tc:.4f}",
-                        f"{tx:.4f}", f"{td:.4f}", f"{ser:.4f}", f"{pipe:.4f}",
-                        f"{tA_total/ser:.3f}", f"{tA_total/pipe:.3f}", f"{GB/tc:.1f}", f"{GB/td:.1f}"])
+            print(f"\n{a} chunk={c} backend={b}  压缩率={raw_total/cb:.3f}（{GB:.1f} GB -> {CGB:.1f} GB）\n"
+                  f"    B1 SM压缩  {tc:.3f}s  ({GB/tc:.0f} GB/s，按原始数据量)\n"
+                  f"    B2 NVLink  {tx:.3f}s  ({CGB/tx:.0f} GB/s，按压缩后数据量)\n"
+                  f"    B3 解压    {td:.3f}s  ({GB/td:.0f} GB/s，按原始数据量)\n"
+                  f"    B串行 {ser:.3f}s | B流水≈{pipe:.3f}s | A直传 {tA_total:.3f}s | "
+                  f"加速比(串行/流水) {tA_total/ser:.2f} / {tA_total/pipe:.2f}")
+            w.writerow([a, c, b, f"{GB:.3f}", f"{CGB:.3f}", f"{raw_total/cb:.4f}", f"{tA_total:.4f}",
+                        f"{tc:.4f}", f"{tx:.4f}", f"{td:.4f}", f"{ser:.4f}", f"{pipe:.4f}",
+                        f"{tA_total/ser:.3f}", f"{tA_total/pipe:.3f}",
+                        f"{GB/tc:.1f}", f"{CGB/tx:.1f}", f"{GB/td:.1f}"])
