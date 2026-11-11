@@ -6,7 +6,7 @@
 #   冒烟测试: python bench_de_xfer.py --algos LZ4 --chunks 65536 --backends hw --max-shards 1 --iters 3
 #   抽样扫参: python bench_de_xfer.py --max-shards 4 --iters 3 --seg-mb 4096 --csv sweep.csv
 #   全模型:   python bench_de_xfer.py --algos LZ4,Deflate --chunks 1048576 --seg-mb 4096 --csv full.csv
-import argparse, csv, glob, itertools, os, time
+import argparse, csv, gc, glob, itertools, os, time
 import torch
 from safetensors.torch import load_file
 from nvidia import nvcomp
@@ -87,12 +87,37 @@ def on(dev, fn):                  # 把 fn 包装成"先切换当前 GPU 到 dev
     return run
 
 
+def run_config(a, c, ref, dst, ssegs, dsegs):
+    """在一个分片上测一种（算法, 分块）组合：B1 压缩、B2 传输、每个后端的 B3 解压"""
+    e = enc[a, c]
+    tc, comps = bench(on(G0, lambda: [e.encode(nvcomp.as_array(x)) for x in ssegs]))   # B1：SM 压缩
+    # encode 返回的数组形状是"预分配的最大容量"，真实压缩大小是 buffer_size，只截取这部分去统计和传输
+    csrcs = [as_u8(x, G0)[:x.buffer_size] for x in comps]
+    cdsts = [torch.empty_like(x, device=G1) for x in csrcs]
+    tx, _ = bench(lambda: [y.copy_(x, non_blocking=True) for x, y in zip(csrcs, cdsts)])  # B2：传压缩数据
+    tds = {}
+    for b in backends:
+        d = dec[a, c, b]
+        if args.no_out:                                               # B3：解压（nvcomp 自己分配输出）
+            td, res = bench(on(G1, lambda: [d.decode(nvcomp.as_array(x)) for x in cdsts]))
+            out_t = torch.cat([as_u8(r, G1) for r in res])[:ref.numel()]
+        else:                                                         # B3：解压到预分配的 dst
+            dst.zero_()                                               # 清零，防止旧数据掩盖解压失败
+            td, _ = bench(on(G1, lambda: [d.decode(nvcomp.as_array(x), out=nvcomp.as_array(y))
+                                          for x, y in zip(cdsts, dsegs)]))
+            out_t = dst
+        assert torch.equal(out_t, ref), f"{a}/{c}/{b} 解压结果和原始数据不一致"   # 无损校验
+        tds[b] = td
+    return sum(x.numel() for x in csrcs), tc, tx, tds   # 函数返回后，压缩数据等显存随局部变量一起释放
+
+
 shards = sorted(glob.glob(os.path.join(args.model_dir, "*.safetensors")))
 assert shards, f"{args.model_dir} 下没有 .safetensors 文件"
 if args.max_shards:
     shards = shards[::max(1, len(shards) // args.max_shards)][:args.max_shards]
 
 raw_total, tA_total, acc = 0, 0.0, {}
+skipped = set()   # 因显存不足跳过的（算法, 分块）组合，汇总时不统计
 for i, f in enumerate(shards):
     ts = load_file(f)                                                    # 读盘不计时
     src = torch.cat([t.reshape(-1).view(torch.uint8) for t in ts.values()]).to(G0)
@@ -109,30 +134,26 @@ for i, f in enumerate(shards):
     dsegs = [dst[o:o + seg] for o in offs]                               # 接收端输出分段（视图，不拷贝）
 
     for a, c in itertools.product(algos, chunks):
-        e = enc[a, c]
-        tc, comps = bench(on(G0, lambda: [e.encode(nvcomp.as_array(x)) for x in ssegs]))   # B1：SM 压缩
-        # encode 返回的数组形状是"预分配的最大容量"，真实压缩大小是 buffer_size，只截取这部分去统计和传输
-        csrcs = [as_u8(x, G0)[:x.buffer_size] for x in comps]
-        cdsts = [torch.empty_like(x, device=G1) for x in csrcs]
-        tx, _ = bench(lambda: [y.copy_(x, non_blocking=True) for x, y in zip(csrcs, cdsts)])  # B2：传压缩数据
-        cbytes = sum(x.numel() for x in csrcs)
+        if (a, c) in skipped:
+            continue
+        oom = False
+        try:
+            cbytes, tc, tx, tds = run_config(a, c, ref, dst, ssegs, dsegs)
+        except RuntimeError as ex:                     # torch.OutOfMemoryError 也是 RuntimeError 的子类
+            if "out of memory" not in str(ex).lower():
+                raise                                  # 不是显存不足的错误照常报出来
+            oom = True
+        if oom:
+            gc.collect(); torch.cuda.empty_cache()     # 异常对象释放后再回收显存，后面的组合才能继续跑
+            skipped.add((a, c))
+            print(f"    {a:7s} chunk={c:>7d} 显存不足，跳过这个组合（可以试更小的 --seg-mb，或去掉这个分块大小）")
+            continue
         s = acc.setdefault((a, c), [0, 0.0, 0.0]); s[0] += cbytes; s[1] += tc; s[2] += tx
         line = f"    {a:7s} chunk={c:>7d} ratio={src.numel()/cbytes:.3f} c={tc*1e3:.1f} x={tx*1e3:.2f}"
         for b in backends:
-            d = dec[a, c, b]
-            if args.no_out:                                               # B3：解压（nvcomp 自己分配输出）
-                td, res = bench(on(G1, lambda: [d.decode(nvcomp.as_array(x)) for x in cdsts]))
-                out_t = torch.cat([as_u8(r, G1) for r in res])[:ref.numel()]
-            else:                                                         # B3：解压到预分配的 dst
-                dst.zero_()                                               # 清零，防止旧数据掩盖解压失败
-                td, _ = bench(on(G1, lambda: [d.decode(nvcomp.as_array(x), out=nvcomp.as_array(y))
-                                              for x, y in zip(cdsts, dsegs)]))
-                out_t = dst
-            assert torch.equal(out_t, ref), f"{a}/{c}/{b} 解压结果和原始数据不一致"   # 无损校验
-            acc[(a, c, b)] = acc.get((a, c, b), 0.0) + td
-            line += f" d[{b}]={td*1e3:.1f}"
+            acc[(a, c, b)] = acc.get((a, c, b), 0.0) + tds[b]
+            line += f" d[{b}]={tds[b]*1e3:.1f}"
         print(line + " ms")
-        del comps, csrcs, cdsts
     del src, ref, dst, ssegs, dsegs
     torch.cuda.empty_cache()
 
@@ -146,6 +167,9 @@ with open(args.csv, "a", newline="") as fp:
                     "decomp_s", "B_serial_s", "B_pipe_s", "speedup_serial", "speedup_pipe",
                     "comp_GBps", "xfer_GBps", "decomp_GBps"])
     for a, c in itertools.product(algos, chunks):
+        if (a, c) in skipped:
+            print(f"\n{a} chunk={c}: 显存不足，已跳过，不计入汇总")
+            continue
         cb, tc, tx = acc[(a, c)]
         CGB = cb / 1e9                                   # 实际传输的压缩数据量
         for b in backends:
