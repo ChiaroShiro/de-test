@@ -31,21 +31,32 @@ say()  { echo -e "\n==================== $* ===================="; }
 warn() { echo "[警告] $*" >&2; }
 die()  { echo "[错误] $*" >&2; exit 1; }
 
-find_model() {    # 在 /data/models 下找 Qwen3-30B-A3B，优先 Instruct-2507，排除量化版本
+find_model() {    # 在 /data/models 下找 Qwen3-30B-A3B：必须同时有 config.json 和 .safetensors，优先 Instruct-2507
   if [[ -n "${MODEL_30B:-}" ]]; then echo "$MODEL_30B"; return 0; fi
-  local list pick
-  list=$(find /data/models -maxdepth 4 -name config.json -ipath "*30b-a3b*" -printf '%h\n' 2>/dev/null \
-         | grep -viE "fp8|fp4|awq|gptq|gguf|int4|int8" | sort -u || true)
-  [[ -n "$list" ]] || return 1
-  pick=$(echo "$list" | grep -i "instruct-2507" | head -n1 || true)
-  [[ -n "$pick" ]] || pick=$(echo "$list" | head -n1)
+  local d pick="" list=()
+  while IFS= read -r d; do
+    if compgen -G "$d/*.safetensors" >/dev/null; then list+=("$d"); fi
+  done < <(find -L /data/models -maxdepth 5 -name config.json -ipath "*30b-a3b*" -printf '%h\n' 2>/dev/null \
+           | grep -viE "fp8|fp4|awq|gptq|gguf|int4|int8|eagle|draft" | sort -u)
+  (( ${#list[@]} > 0 )) || return 1
+  for d in "${list[@]}"; do
+    echo "  找到候选模型目录: $d" >&2
+    if [[ -z "$pick" && "${d,,}" == *instruct-2507* ]]; then pick=$d; fi
+  done
+  [[ -n "$pick" ]] || pick=${list[0]}
   echo "$pick"
 }
 
 prepare() {       # 每个阶段都需要：确定模型路径、决定 offload 方式
-  MODEL_30B=$(find_model) || die "在 /data/models 下没找到 Qwen3-30B-A3B 模型，请用 MODEL_30B=模型目录 指定"
+  if ! MODEL_30B=$(find_model); then
+    echo "/data/models 下的内容：" >&2; ls -la /data/models >&2 || true
+    die "在 /data/models 下没找到同时含 config.json 和 .safetensors 的 Qwen3-30B-A3B 目录，请用 MODEL_30B=模型目录 指定"
+  fi
   export MODEL_30B
-  ls "$MODEL_30B"/*.safetensors >/dev/null 2>&1 || die "$MODEL_30B 下没有 .safetensors 权重文件"
+  if ! compgen -G "$MODEL_30B/*.safetensors" >/dev/null; then
+    echo "$MODEL_30B 下的内容：" >&2; ls -la "$MODEL_30B" >&2 || true
+    die "$MODEL_30B 下没有 .safetensors 权重文件，请确认 MODEL_30B 指向的是模型权重所在的那一层目录"
+  fi
   local mem
   mem=$(free -g | awk '/^Mem:/{print $7}')
   if   (( mem >= 600 )); then export PARAM_OFFLOAD=True  OPT_OFFLOAD=True
