@@ -13,23 +13,116 @@ namespace ptx = cuda::ptx;
     std::fprintf(stderr, "%s:%d %s: %s\n", __FILE__, __LINE__, #call, cudaGetErrorString(e)); \
     std::exit(1); } } while (0)
 
-// Four single-thread CTAs. Rank 0 and rank 3 belong to different MMA pairs.
-__global__ void __cluster_dims__(4, 1, 1) dsm_check(int* result) {
+constexpr int ring_size = 1024, hop = 67, steps = 4097, samples = 11;
+constexpr int exchanges = 31;
+struct DsmResult {
+    unsigned sm[4], end_sm[4];
+    int observed[2];
+    unsigned long long ticks[2][2][samples + 1]; // direction, local/peer, sample
+    unsigned long long bulk_ns[2][samples + 1];
+    unsigned bulk_error;
+};
+
+__device__ unsigned sm_id() {
+    unsigned id;
+    asm volatile("mov.u32 %0, %%smid;" : "=r"(id));
+    return id;
+}
+
+__device__ unsigned long long timer_ns() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t) :: "memory");
+    return t;
+}
+
+// Two active CTAs simultaneously copy one 4 KiB block each, then synchronize.
+// Each round reads the previous round's result. Only rank 0 times the exchange.
+__device__ void bulk_exchange(unsigned* buf, DsmResult* result) {
+    auto cluster = cg::this_cluster();
+    int rank = cluster.block_rank(), tid = threadIdx.x;
+    bool active = rank == 0 || rank == 3;
+    for (int s = 0; s <= samples; ++s) {
+        for (int turn = 0; turn < 2; ++turn) {
+            int remote = (s + turn) % 2;
+            volatile unsigned* dst = remote ? cluster.map_shared_rank(buf, 3-rank) : buf;
+            for (int i = tid; i < ring_size; i += blockDim.x) buf[i] = rank * ring_size + i;
+            cluster.sync();
+            unsigned long long start = 0;
+            if (rank == 0 && tid == 0) start = timer_ns();
+            cluster.sync();
+            for (int r = 0; r < exchanges; ++r) {
+                int src_page = (r % 2) * ring_size;
+                if (active)
+                    for (int i = tid; i < ring_size; i += blockDim.x)
+                        dst[ring_size - src_page + i] = buf[src_page + i] + 1;
+                cluster.sync();
+            }
+            if (rank == 0 && tid == 0) result->bulk_ns[remote][s] = timer_ns() - start;
+            int source = remote ? 3-rank : rank; // An odd number of exchanges.
+            if (active)
+                for (int i = tid; i < ring_size; i += blockDim.x)
+                    if (buf[ring_size + i] != unsigned(source * ring_size + i + exchanges))
+                        atomicOr(&result->bulk_error, 1u);
+        }
+    }
+}
+
+// Each loaded index determines the next address. Start and end clocks both
+// have data dependencies so the last memory access is included.
+template<bool remote>
+__device__ unsigned long long chase(unsigned base) {
+    unsigned long long begin, end;
+    asm volatile("mov.u64 %0, %%clock64;" : "=l"(begin) :: "memory");
+    unsigned first = unsigned(begin) & (ring_size - 1), index = first;
+    #pragma unroll 1
+    for (int i = 0; i < steps; ++i) {
+        unsigned address = base + 4 * index;
+        if constexpr (remote)
+            asm volatile("ld.shared::cluster.u32 %0,[%1];" : "=r"(index) : "r"(address) : "memory");
+        else
+            asm volatile("ld.shared::cta.u32 %0,[%1];" : "=r"(index) : "r"(address) : "memory");
+    }
+    asm volatile("{ .reg .pred ok; setp.eq.u32 ok,%1,%2; mov.u64 %0,0; @ok mov.u64 %0,%%clock64; }"
+                 : "=l"(end) : "r"(index), "r"((first + steps * hop) & (ring_size - 1)) : "memory");
+    return end ? end - begin : 0;
+}
+
+__global__ void __cluster_dims__(4, 1, 1) dsm_check(DsmResult* result) {
     __shared__ int value;
+    __shared__ unsigned ring[2 * ring_size];
     auto cluster = cg::this_cluster();
     int rank = cluster.block_rank();
-    value = 100 + rank;
+    if (threadIdx.x == 0) {
+        result->sm[rank] = sm_id();
+        value = 100 + rank;
+    }
+    for (int i = threadIdx.x; i < ring_size; i += blockDim.x) ring[i] = (i + hop) & (ring_size - 1);
     cluster.sync();
-    if (rank == 0) {
+    if (rank == 0 && threadIdx.x == 0) {
         volatile int* remote = cluster.map_shared_rank(&value, 3);
-        result[0] = *remote;
+        result->observed[0] = *remote;
         *remote = 777;
     }
     cluster.sync();
-    if (rank == 3) result[1] = value;
+    if (rank == 3 && threadIdx.x == 0) result->observed[1] = value;
+    for (int direction = 0; direction < 2; ++direction) {
+        int src = direction * 3, dst = 3 - src;
+        if (rank == src && threadIdx.x == 0) {
+            unsigned local = __cvta_generic_to_shared(ring), peer;
+            asm("mapa.shared::cluster.u32 %0,%1,%2;" : "=r"(peer) : "r"(local), "r"(dst));
+            for (int s = 0; s <= samples; ++s) {
+                for (int turn = 0; turn < 2; ++turn) {
+                    int remote = (s + turn) % 2;
+                    result->ticks[direction][remote][s] = remote ? chase<true>(peer) : chase<false>(local);
+                }
+            }
+        }
+        cluster.sync(); // Only one active reader; keep every remote allocation alive.
+    }
+    bulk_exchange(ring, result);
+    if (threadIdx.x == 0) result->end_sm[rank] = sm_id();
 }
 
-constexpr int tasks = 32768;
 constexpr int lanes = 32;
 __host__ __device__ unsigned work(int task, int lane) {
     unsigned x = unsigned(task * lanes + lane);
@@ -41,7 +134,7 @@ __host__ __device__ unsigned work(int task, int lane) {
 // One warp per CTA. Both schedulers start with blockIdx.x and ask for one
 // additional task at a time. Only lane 0 touches either scheduler.
 template<bool use_clc>
-__global__ void schedule(int* head, unsigned* output, int* visits, int* owner) {
+__global__ void schedule(int tasks, int* head, unsigned* output, int* visits, int* owner) {
     [[maybe_unused]] __shared__ uint4 reply;
     [[maybe_unused]] __shared__ std::uint64_t barrier;
     [[maybe_unused]] int phase = 0;
@@ -83,30 +176,57 @@ __global__ void schedule(int* head, unsigned* output, int* visits, int* owner) {
     }
 }
 
-int main() {
-    cudaDeviceProp gpu{};
-    CUDA(cudaGetDeviceProperties(&gpu, 0));
-    std::printf("GPU: %s, SM %d.%d, %d SMs\n", gpu.name, gpu.major, gpu.minor, gpu.multiProcessorCount);
-    if (gpu.major != 10 || gpu.minor != 0) return 1;
-
-    int *head, *visits, *owner;
-    unsigned* output;
-    CUDA(cudaMalloc(&visits, tasks * sizeof(int)));
-    dsm_check<<<4, 1>>>(visits);
+int run_dsm() {
+    DsmResult dsm{}, *device_dsm;
+    CUDA(cudaMalloc(&device_dsm, sizeof(dsm)));
+    CUDA(cudaMemset(device_dsm, 0, sizeof(dsm)));
+    dsm_check<<<4, 128>>>(device_dsm);
     CUDA(cudaGetLastError());
-    int observed[2];
-    CUDA(cudaMemcpy(observed, visits, sizeof(observed), cudaMemcpyDeviceToHost));
+    CUDA(cudaMemcpy(&dsm, device_dsm, sizeof(dsm), cudaMemcpyDeviceToHost));
+    CUDA(cudaFree(device_dsm));
+    for (int i = 0; i < 4; ++i)
+        std::printf("DSM  CTA%d: SM %u (end %u)\n", i, dsm.sm[i], dsm.end_sm[i]);
+    const int* observed = dsm.observed;
     bool dsm_ok = observed[0] == 103 && observed[1] == 777;
     std::printf("DSM  CTA0 read CTA3: %d (expect 103); CTA3 saw write: %d (expect 777)  %s\n",
                 observed[0], observed[1], dsm_ok ? "PASS" : "FAIL");
     if (!dsm_ok) return 1;
+    for (int dir = 0; dir < 2; ++dir) {
+        double cycles[2];
+        for (int mode = 0; mode < 2; ++mode) {
+            auto* t = dsm.ticks[dir][mode] + 1; // Drop warm-up.
+            std::sort(t, t + samples);
+            if (!t[0]) { std::fprintf(stderr, "DSM pointer chain FAIL\n"); return 1; }
+            cycles[mode] = double(t[samples / 2]) / steps;
+        }
+        bool stable = dsm.sm[0] == dsm.end_sm[0] && dsm.sm[3] == dsm.end_sm[3];
+        const char* placement = !stable ? "SM ID changed" : dsm.sm[0] == dsm.sm[3] ? "same SM" : "different SMs";
+        std::printf("DSM  CTA%d -> CTA%d (%s): local %.1f | peer %.1f cycles/load | peer/local %.2fx\n",
+                    3*dir, 3-3*dir, placement, cycles[0], cycles[1], cycles[1]/cycles[0]);
+    }
 
+    if (dsm.bulk_error) { std::fprintf(stderr, "DSM block exchange FAIL\n"); return 1; }
+    double payload = 2.0 * ring_size * sizeof(unsigned) * exchanges;
+    for (int remote = 0; remote < 2; ++remote) {
+        auto* t = dsm.bulk_ns[remote] + 1;
+        std::sort(t, t + samples);
+        if (!t[0]) return 1;
+        std::printf("DSM  4 KiB per CTA, 2 senders: %-5s %.2f GB/s (payload, includes cluster sync) PASS\n",
+                    remote ? "peer" : "local", payload / t[samples / 2]);
+    }
+    return 0;
+}
+
+int run_schedulers(int tasks, int sms) {
+    int *head, *visits, *owner;
+    unsigned* output;
+    CUDA(cudaMalloc(&visits, tasks * sizeof(int)));
     CUDA(cudaMalloc(&head, sizeof(int)));
     CUDA(cudaMalloc(&output, tasks * sizeof(unsigned)));
     CUDA(cudaMalloc(&owner, tasks * sizeof(int)));
     int per_sm;
     CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, schedule<false>, lanes, 0));
-    int workers = std::min(tasks, per_sm * gpu.multiProcessorCount);
+    int workers = std::min(tasks, per_sm * sms);
     std::printf("Tasks: %d, threads/CTA: %d, atomic worker CTAs: %d, CLC logical CTAs: %d\n",
                 tasks, lanes, workers, tasks);
 
@@ -128,8 +248,8 @@ int main() {
             if (run == 0) CUDA(cudaMemset(visits, 0, tasks * sizeof(int)));
             int* audit = run == 0 ? visits : nullptr;
             CUDA(cudaEventRecord(start));
-            if (clc) schedule<true><<<tasks, lanes>>>(head, output, audit, owner);
-            else schedule<false><<<workers, lanes>>>(head, output, audit, owner);
+            if (clc) schedule<true><<<tasks, lanes>>>(tasks, head, output, audit, owner);
+            else schedule<false><<<workers, lanes>>>(tasks, head, output, audit, owner);
             CUDA(cudaEventRecord(stop));
             CUDA(cudaGetLastError());
             CUDA(cudaEventSynchronize(stop));
@@ -163,4 +283,15 @@ int main() {
                 atomic_ms, clc_ms, atomic_ms / clc_ms);
     CUDA(cudaEventDestroy(start)); CUDA(cudaEventDestroy(stop));
     CUDA(cudaFree(head)); CUDA(cudaFree(output)); CUDA(cudaFree(visits)); CUDA(cudaFree(owner));
+    return 0;
+}
+
+int main() {
+    cudaDeviceProp gpu{};
+    CUDA(cudaGetDeviceProperties(&gpu, 0));
+    std::printf("GPU: %s, SM %d.%d, %d SMs\n", gpu.name, gpu.major, gpu.minor, gpu.multiProcessorCount);
+    if (gpu.major != 10 || gpu.minor != 0 || run_dsm()) return 1;
+    for (int tasks : {32768, 327680})
+        if (run_schedulers(tasks, gpu.multiProcessorCount)) return 1;
+    return 0;
 }

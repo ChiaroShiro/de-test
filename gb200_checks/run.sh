@@ -27,3 +27,7 @@ grep -E 'Operand SMEM|Grid launched|Cluster launched|relative error|Execution is
 # The tutorial also exits zero for a numerical failure or a skipped build.
 grep -Fxq 'Execution is successful.' build/mma.log || { cat build/mma.log; exit 1; }
 echo '2-CTA MMA PASS  256x256x64 FP16 GEMM checked against CPU reference'
+
+nvcc "${flags[@]}" -diag-suppress=177 -I"$cutlass/include" -I"$cutlass/tools/util/include" \
+    gemm_compare.cu -o build/gemm_compare -lcuda
+./build/gemm_compare
